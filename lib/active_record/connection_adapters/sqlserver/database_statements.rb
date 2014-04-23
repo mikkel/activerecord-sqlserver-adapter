@@ -302,7 +302,14 @@ module ActiveRecord
         protected
         
         def select(sql, name = nil, binds = [])
-          exec_query(sql, name, binds)
+          retries = 0
+          begin
+            exec_query(sql, name, binds)
+          rescue TinyTds::Error, ActiveRecord::StatementInvalid
+            raise if retries > 4
+            retries += 1
+            retry
+          end
         end
         
         def sql_for_insert(sql, pk, id_value, sequence_name, binds)
