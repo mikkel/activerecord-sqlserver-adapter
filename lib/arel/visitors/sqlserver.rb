@@ -1,14 +1,14 @@
 module Arel
   module Visitors
     class SQLServer < Arel::Visitors::ToSql
-
       private
 
       # SQLServer ToSql/Visitor (Overides)
-
       def visit_Arel_Nodes_SelectStatement(o, a)
         if complex_count_sql?(o)
           visit_Arel_Nodes_SelectStatementForComplexCount(o, a)
+        elsif distinct_non_present_orders?(o, a)
+          visit_Arel_Nodes_SelectStatementDistinctNonPresentOrders(o, a)
         elsif o.offset
           visit_Arel_Nodes_SelectStatementWithOffset(o, a)
         else
@@ -18,7 +18,7 @@ module Arel
 
       def visit_Arel_Nodes_UpdateStatement(o, a)
         if o.orders.any? && o.limit.nil?
-          o.limit = Nodes::Limit.new(9223372036854775807)
+          o.limit = Nodes::Limit.new(9_223_372_036_854_775_807)
         end
         super
       end
@@ -49,6 +49,76 @@ module Arel
 
       # SQLServer ToSql/Visitor (Additions)
 
+      # This constructs a query using DENSE_RANK() and ROW_NUMBER() to allow
+      # ordering a DISTINCT set of data by columns in another table that are
+      # not part of what we actually want to be DISTINCT. Without this, it is
+      # possible for the DISTINCT qualifier combined with TOP to return fewer
+      # rows than were requested.
+      def visit_Arel_Nodes_SelectStatementDistinctNonPresentOrders(o, a)
+        core = o.cores.first
+        projections = core.projections
+        groups = core.groups
+        orders = o.orders.uniq
+
+        select_frags = projections.map do |x|
+          frag = projection_to_sql_remove_distinct(x, core, a)
+          # Remove the table specifier
+          frag.gsub!(/^[^\.]*\./, '')
+          # If there is an alias, remove everything but
+          frag.gsub(/^.*\sAS\s+/i, '')
+        end
+
+        if o.offset
+          select_frags << 'ROW_NUMBER() OVER (ORDER BY __order) AS __offset'
+        else
+          select_frags << '__order'
+        end
+
+        projection_list = projections.map { |x| projection_to_sql_remove_distinct(x, core, a) }.join(', ')
+
+        sql = [
+          ('SELECT'),
+          (visit(core.set_quantifier, a) if core.set_quantifier && !o.offset),
+          (visit(o.limit, a) if o.limit && !o.offset),
+          (select_frags.join(', ')),
+          ('FROM ('),
+            ('SELECT'),
+            (
+              [
+                (projection_list),
+                (', DENSE_RANK() OVER ('),
+                  ("ORDER BY #{orders.map { |x| visit(x, a) }.join(', ')}" unless orders.empty?),
+                (') AS __order'),
+                (', ROW_NUMBER() OVER ('),
+                  ("PARTITION BY #{projection_list}" if !orders.empty?),
+                  (" ORDER BY #{orders.map { |x| visit(x, a) }.join(', ')}" unless orders.empty?),
+                (') AS __joined_row_num')
+              ].join('')
+            ),
+            (source_with_lock_for_select_statement(o, a)),
+            ("WHERE #{core.wheres.map { |x| visit(x, a) }.join ' AND ' }" unless core.wheres.empty?),
+            ("GROUP BY #{groups.map { |x| visit(x, a) }.join ', ' }" unless groups.empty?),
+            (visit(core.having, a) if core.having),
+          (') AS __sq'),
+          ('WHERE __joined_row_num = 1'),
+          ('ORDER BY __order' unless o.offset)
+        ].compact.join(' ')
+
+        if o.offset
+          sql = [
+            ('SELECT'),
+            (visit(core.set_quantifier, a) if core.set_quantifier),
+            (visit(o.limit, a) if o.limit),
+            ('*'),
+            ('FROM (' + sql + ') AS __osq'),
+            ("WHERE __offset > #{visit(o.offset.expr, a)}"),
+            ('ORDER BY __offset')
+          ].join(' ')
+        end
+
+        sql
+      end
+
       def visit_Arel_Nodes_SelectStatementWithOutOffset(o, a, windowed = false)
         find_and_fix_uncorrelated_joins_in_select_statement(o)
         core = o.cores.first
@@ -69,31 +139,36 @@ module Arel
         elsif top_one_everything_for_through_join?(o, a)
           projections = projections.map { |x| projection_without_expression(x, a) }
         end
-        [ ("SELECT" if !windowed),
+        [
+          ('SELECT' unless windowed),
           (visit(core.set_quantifier, a) if core.set_quantifier && !windowed),
           (visit(o.limit, a) if o.limit && !windowed),
-          (projections.map{ |x| v = visit(x, a); v == "1" ? "1 AS [__wrp]" : v }.join(', ')),
+          (projections.map do |x|
+            v = visit(x, a)
+            v == '1' ? '1 AS [__wrp]' : v
+          end.join(', ')),
           (source_with_lock_for_select_statement(o, a)),
-          ("WHERE #{core.wheres.map{ |x| visit(x, a) }.join ' AND ' }" unless core.wheres.empty?),
+          ("WHERE #{core.wheres.map { |x| visit(x, a) }.join ' AND ' }" unless core.wheres.empty?),
           ("GROUP BY #{groups.map { |x| visit(x, a) }.join ', ' }" unless groups.empty?),
           (visit(core.having, a) if core.having),
-          ("ORDER BY #{orders.map{ |x| visit(x, a) }.join(', ')}" if !orders.empty? && !windowed)
+          ("ORDER BY #{orders.map { |x| visit(x, a) }.join(', ')}" if !orders.empty? && !windowed)
         ].compact.join ' '
       end
 
       def visit_Arel_Nodes_SelectStatementWithOffset(o, a)
         core = o.cores.first
-        o.limit ||= Arel::Nodes::Limit.new(9223372036854775807)
+        o.limit ||= Arel::Nodes::Limit.new(9_223_372_036_854_775_807)
         orders = rowtable_orders(o)
-        [ "SELECT",
+        [
+          'SELECT',
           (visit(o.limit, a) if o.limit && !windowed_single_distinct_select_statement?(o)),
-          (rowtable_projections(o, a).map{ |x| visit(x, a) }.join(', ')),
-          "FROM (",
-            "SELECT #{core.set_quantifier ? 'DISTINCT DENSE_RANK()' : 'ROW_NUMBER()'} OVER (ORDER BY #{orders.map{ |x| visit(x, a) }.join(', ')}) AS [__rn],",
-            visit_Arel_Nodes_SelectStatementWithOutOffset(o, a, true),
-          ") AS [__rnt]",
+          (rowtable_projections(o, a).map { |x| visit(x, a) }.join(', ')),
+          'FROM (',
+          "SELECT #{core.set_quantifier ? 'DISTINCT DENSE_RANK()' : 'ROW_NUMBER()'} OVER (ORDER BY #{orders.map { |x| visit(x, a) }.join(', ')}) AS [__rn],",
+          visit_Arel_Nodes_SelectStatementWithOutOffset(o, a, true),
+          ') AS [__rnt]',
           (visit(o.offset, a) if o.offset),
-          "ORDER BY [__rnt].[__rn] ASC"
+          'ORDER BY [__rnt].[__rn] ASC'
         ].compact.join ' '
       end
 
@@ -101,24 +176,36 @@ module Arel
         core = o.cores.first
         o.limit.expr = Arel.sql("#{o.limit.expr} + #{o.offset ? o.offset.expr : 0}") if o.limit
         orders = rowtable_orders(o)
-        [ "SELECT COUNT([count]) AS [count_id]",
-          "FROM (",
-            "SELECT",
-            (visit(o.limit, a) if o.limit),
-            "ROW_NUMBER() OVER (ORDER BY #{orders.map{ |x| visit(x, a) }.join(', ')}) AS [__rn],",
-            "1 AS [count]",
-            (source_with_lock_for_select_statement(o, a)),
-            ("WHERE #{core.wheres.map{ |x| visit(x, a) }.join ' AND ' }" unless core.wheres.empty?),
-            ("GROUP BY #{core.groups.map { |x| visit(x, a) }.join ', ' }" unless core.groups.empty?),
-            (visit(core.having, a) if core.having),
-            ("ORDER BY #{o.orders.map{ |x| visit(x, a) }.join(', ')}" if !o.orders.empty?),
-          ") AS [__rnt]",
+        [
+          'SELECT COUNT([count]) AS [count_id]',
+          'FROM (',
+          'SELECT',
+          (visit(o.limit, a) if o.limit),
+          "ROW_NUMBER() OVER (ORDER BY #{orders.map { |x| visit(x, a) }.join(', ')}) AS [__rn],",
+          '1 AS [count]',
+          (source_with_lock_for_select_statement(o, a)),
+          ("WHERE #{core.wheres.map { |x| visit(x, a) }.join ' AND ' }" unless core.wheres.empty?),
+          ("GROUP BY #{core.groups.map { |x| visit(x, a) }.join ', ' }" unless core.groups.empty?),
+          (visit(core.having, a) if core.having),
+          ("ORDER BY #{o.orders.map { |x| visit(x, a) }.join(', ')}" unless o.orders.empty?),
+          ') AS [__rnt]',
           (visit(o.offset, a) if o.offset)
         ].compact.join ' '
       end
 
-
       # SQLServer Helpers
+
+      def projection_to_sql_remove_distinct(x, core, a)
+        frag = Arel.sql(visit(x, a))
+        # In Rails 4.0.0, DISTINCT was in a projection, whereas with 4.0.1
+        # it is now stored in the set_quantifier. This moves it to the correct
+        # place so the code works on both 4.0.0 and 4.0.1.
+        if frag =~ /^\s*DISTINCT\s+/i
+          core.set_quantifier = Arel::Nodes::Distinct.new
+          frag.gsub!(/\s*DISTINCT\s+/, '')
+        end
+        frag
+      end
 
       def source_with_lock_for_select_statement(o, a)
         core = o.cores.first
@@ -142,7 +229,7 @@ module Arel
         # elsif Arel::Nodes::JoinSource === core.source
         #   Arel::Nodes::SqlLiteral === core.source.left ? Arel::Table.new(core.source.left, @engine) : core.source.left
         # end
-        table_finder = lambda { |x|
+        table_finder = lambda do |x|
           case x
           when Arel::Table
             x
@@ -151,7 +238,7 @@ module Arel
           when Arel::Nodes::Join
             table_finder.call(x.left)
           end
-        }
+        end
         table_finder.call(core.froms)
       end
 
@@ -163,8 +250,67 @@ module Arel
             p1.respond_to?(:include?) && p1.include?('DISTINCT'))
       end
 
-      def windowed_single_distinct_select_statement?(o)
+      # Determine if the SELECT statement is asking for DISTINCT results,
+      # but is using columns not part of the SELECT list in the ORDER BY.
+      # This is necessary because SQL Server requires all ORDER BY entries
+      # be in the SELECT list with DISTINCT. However, these ordering columns
+      # can cause duplicate rows, which affect when using a limit.
+      def distinct_non_present_orders?(o, a)
+        projections = o.cores.first.projections
 
+        sq = o.cores.first.set_quantifier
+        p1 = projections.first
+
+        found_distinct = sq && sq.class.to_s =~ /Distinct/
+        if (p1.respond_to?(:distinct) && p1.distinct) || (p1.respond_to?(:include?) && p1.include?('DISTINCT'))
+          found_distinct = true
+        end
+
+        return false if !found_distinct || o.orders.uniq.empty?
+
+        tables_all_columns = []
+        expressions = projections.map do |p|
+          visit(p, a).split(',').map do |x|
+            x.strip!
+            # Rails 4.0.0 included DISTINCT in the first projection
+            x.gsub!(/\s*DISTINCT\s+/, '')
+            # Aliased column names
+            x.gsub!(/\s+AS\s+\w+/i, '')
+            # Identifier quoting
+            x.gsub!(/\[|\]/, '')
+            star_match = /^(\w+)\.\*$/.match(x)
+            tables_all_columns << star_match[1] if star_match
+            x.strip.downcase
+          end.join(', ')
+        end
+
+        # Make sure each order by is in the select list, otherwise there needs
+        # to be a subquery with row_numbe()
+        o.orders.uniq.each do |order|
+          order = visit(order, a)
+          order.strip!
+
+          order.gsub!(/\s+(asc|desc)/i, '')
+          # Identifier quoting
+          order.gsub!(/\[|\]/, '')
+
+          order.strip!
+          order.downcase!
+
+          # If we selected all columns from a table, the order is ok
+          table_match = /^(\w+)\.\w+$/.match(order)
+          next if table_match && tables_all_columns.include?(table_match[1])
+
+          next if expressions.include?(order)
+
+          return true
+        end
+
+        # We didn't find anything in the order by no being selected
+        false
+      end
+
+      def windowed_single_distinct_select_statement?(o)
         o.limit &&
           o.offset &&
           single_distinct_select_statement?(o)
@@ -172,7 +318,7 @@ module Arel
 
       def single_distinct_select_everything_statement?(o, a)
         single_distinct_select_statement?(o) &&
-          visit(o.cores.first.projections.first, a).ends_with?(".*")
+          visit(o.cores.first.projections.first, a).ends_with?('.*')
       end
 
       def top_one_everything_for_through_join?(o, a)
@@ -240,7 +386,7 @@ module Arel
         j2 = core.froms.right
         return unless Arel::Nodes::OuterJoin === j1 && Arel::Nodes::SqlLiteral === j2 && j2.include?('JOIN ')
         j1_tn = j1.right.name
-        j2_tn = j2.match(/JOIN \[(.*)\].*ON/).try(:[],1)
+        j2_tn = j2.match(/JOIN \[(.*)\].*ON/).try(:[], 1)
         return unless j1_tn == j2_tn
         on_index = j2.index(' ON ')
         j2.insert on_index, " AS [#{j2_tn}_crltd]"
@@ -255,7 +401,7 @@ module Arel
             x.dup.tap do |p|
               p.sub! 'DISTINCT', ''
               p.insert 0, visit(o.limit, a) if o.limit
-              p.gsub! /\[?#{tn}\]?\./, '[__rnt].'
+              p.gsub!(/\[?#{tn}\]?\./, '[__rnt].')
               p.strip!
             end
           end
@@ -264,13 +410,13 @@ module Arel
           core.projections.map do |x|
             x.dup.tap do |p|
               p.sub! 'DISTINCT', "DISTINCT #{visit(o.limit, a)}".strip if o.limit
-              p.gsub! /\[?#{tn}\]?\./, '[__rnt].'
+              p.gsub!(/\[?#{tn}\]?\./, '[__rnt].')
               p.strip!
             end
           end
         elsif join_in_select_statement?(o) && all_projections_aliased_in_select_statement?(o, a)
           core.projections.map do |x|
-            Arel.sql visit(x, a).split(',').map{ |y| y.split(' AS ').last.strip }.join(', ')
+            Arel.sql visit(x, a).split(',').map { |y| y.split(' AS ').last.strip }.join(', ')
           end
         elsif select_primary_key_sql?(o)
           [Arel.sql("[__rnt].#{quote_column_name(core.projections.first.name)}")]
@@ -280,7 +426,6 @@ module Arel
       end
 
       def rowtable_orders(o)
-        core = o.cores.first
         if !o.orders.empty?
           o.orders
         else
@@ -294,16 +439,14 @@ module Arel
       def projection_without_expression(projection, a)
         Arel.sql(visit(projection, a).split(',').map do |x|
           x.strip!
-          x.sub!(/^(COUNT|SUM|MAX|MIN|AVG)\s*(\((.*)\))?/,'\3')
-          x.sub!(/^DISTINCT\s*/,'')
-          x.sub!(/TOP\s*\(\d+\)\s*/i,'')
+          x.sub!(/^(COUNT|SUM|MAX|MIN|AVG)\s*(\((.*)\))?/, '\3')
+          x.sub!(/^DISTINCT\s*/, '')
+          x.sub!(/TOP\s*\(\d+\)\s*/i, '')
           x.strip
         end.join(', '))
       end
-
     end
   end
-
 end
 
 Arel::Visitors::VISITORS['sqlserver'] = Arel::Visitors::SQLServer

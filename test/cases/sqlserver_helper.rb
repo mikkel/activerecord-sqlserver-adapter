@@ -16,6 +16,7 @@ require 'simplecov'
 SimpleCov.start do
   add_filter "/test/"
 end
+require 'pry'
 require 'graphviz'
 require 'mocha/api'
 require 'active_support/dependencies'
@@ -23,6 +24,7 @@ require 'active_record'
 require 'active_record/version'
 require 'active_record/connection_adapters/abstract_adapter'
 require 'minitest-spec-rails'
+require 'minitest-spec-rails/init/active_support'
 require 'minitest-spec-rails/init/mini_shoulda'
 require 'cases/helper'
 require 'models/topic'
@@ -42,7 +44,7 @@ module SqlserverCoercedTest
   def self.included(base)
     base.extend ClassMethods
   end
-  
+
   module ClassMethods
 
     def self.extended(base)
@@ -52,11 +54,11 @@ module SqlserverCoercedTest
         end
       end
     end
-    
+
     def coerced_tests
       self.const_get(:COERCED_TESTS) rescue nil
     end
-    
+
     def method_added(method)
       if coerced_tests && coerced_tests.include?(method)
         undefine_and_puts(method)
@@ -67,7 +69,7 @@ module SqlserverCoercedTest
       result = undef_method(method) rescue nil
       STDOUT.puts("Info: Undefined coerced test: #{self.name}##{method}") unless result.blank?
     end
-  
+
   end
 end
 

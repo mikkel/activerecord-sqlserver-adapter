@@ -2,7 +2,6 @@ module ActiveRecord
   module ConnectionAdapters
     module Sqlserver
       module Quoting
-
         QUOTED_TRUE, QUOTED_FALSE = '1', '0'
         QUOTED_STRING_PREFIX = 'N'
 
@@ -13,6 +12,8 @@ module ActiveRecord
               value.to_i.to_s
             elsif column && column.type == :binary
               column.class.string_to_binary(value)
+            elsif column && [:uuid, :uniqueidentifier].include?(column.type)
+              "'#{quote_string(value)}'"
             elsif value.is_utf8? || (column && column.type == :string)
               "#{quoted_string_prefix}'#{quote_string(value)}'"
             else
@@ -53,11 +54,20 @@ module ActiveRecord
           schema_cache.quote_name(name, false)
         end
 
+        # Does not quote function default values for UUID columns
+        def quote_default_value(value, column)
+          if column.type == :uuid && value =~ /\(\)/
+            value
+          else
+            quote(value)
+          end
+        end
+
         def substitute_at(column, index)
           if column.respond_to?(:sql_type) && column.sql_type == 'timestamp'
             nil
           else
-            Arel.sql "@#{index}"
+            Arel::Nodes::BindParam.new "@#{index}"
           end
         end
 
@@ -92,7 +102,7 @@ module ActiveRecord
 
         def quoted_date(value)
           if value.acts_like?(:time) && value.respond_to?(:usec)
-            "#{super}.#{sprintf("%03d",value.usec/1000)}"
+            "#{super}.#{sprintf('%03d', value.usec / 1000)}"
           elsif value.acts_like?(:date)
             value.to_s(:_sqlserver_dateformat)
           else
@@ -106,7 +116,6 @@ module ActiveRecord
           zone_conversion_method = ActiveRecord::Base.default_timezone == :utc ? :getutc : :getlocal
           value.respond_to?(zone_conversion_method) ? value.send(zone_conversion_method) : value
         end
-
       end
     end
   end

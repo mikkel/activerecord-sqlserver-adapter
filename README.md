@@ -5,8 +5,9 @@ The SQL Server adapter for ActiveRecord. If you need the adapter for SQL Server 
 
 ## What's New
 
-* Rails 4 support (not yet released, look at outstanding issues)
-* Ruby 2.0.0 and 2.1.0.prerelease support
+* Rails 4.0 and 4.1 support
+* Ruby 2.0 and 2.1 support
+
 
 #### Testing Rake Tasks Support
 
@@ -36,7 +37,7 @@ Every class that sub classes ActiveRecord::Base will now have an execute_procedu
 ```ruby
 Account.execute_procedure :update_totals, 'admin', nil, true
 # Or with named parameters.
-Account.execute_procedure :update_totals, :named => 'params'
+Account.execute_procedure :update_totals, named: 'params'
 ```
 
 #### Native Data Type Support
@@ -53,9 +54,9 @@ Currently the following custom data types have been tested for schema definition
 For example:
 
 ```ruby
-create_table :sql_server_custom_types, :force => true do |t|
-  t.column :ten_code,       :char,      :limit => 10
-  t.column :ten_code_utf8,  :nchar,     :limit => 10
+create_table :sql_server_custom_types, force: true do |t|
+  t.column :ten_code,       :char,      limit: 10
+  t.column :ten_code_utf8,  :nchar,     limit: 10
   t.column :title_utf8,     :nvarchar
   t.column :body,           :varchar_max    # Creates varchar(max)
   t.column :body_utf8,      :ntext
@@ -159,7 +160,7 @@ end
 The 3.2 version of the adapter support ActiveRecord's explain features. In SQL Server, this is called the showplan. By default we use the `SHOWPLAN_ALL` option and format it using a simple table printer. So the following ruby would log the plan table below it.
 
 ```ruby
-Car.where(:id => 1).explain
+Car.where(id: 1).explain
 ```
 
 ```

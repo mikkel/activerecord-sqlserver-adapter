@@ -2,7 +2,6 @@ module ActiveRecord
   module ConnectionAdapters
     module Sqlserver
       module SchemaStatements
-
         def native_database_types
           @native_database_types ||= initialize_native_database_types.freeze
         end
@@ -17,9 +16,15 @@ module ActiveRecord
           super || tables.include?(unquoted_table_name) || views.include?(unquoted_table_name)
         end
 
+        def create_table(table_name, options = {})
+          res = super
+          schema_cache.clear_table_cache!(table_name)
+          res
+        end
+
         def indexes(table_name, name = nil)
-          data = select("EXEC sp_helpindex #{quote(table_name)}",name) rescue []
-          data.inject([]) do |indexes,index|
+          data = select("EXEC sp_helpindex #{quote(table_name)}", name) rescue []
+          data.reduce([]) do |indexes, index|
             index = index.with_indifferent_access
             if index[:index_description] =~ /primary key/
               indexes
@@ -36,26 +41,21 @@ module ActiveRecord
           end
         end
 
-        def columns(table_name, name = nil)
+        def columns(table_name, _name = nil)
           return [] if table_name.blank?
-          column_definitions(table_name).collect do |ci|
-            sqlserver_options = ci.except(:name,:default_value,:type,:null).merge(:database_year=>database_year)
+          column_definitions(table_name).map do |ci|
+            sqlserver_options = ci.except(:name, :default_value, :type, :null).merge(database_year: database_year)
             SQLServerColumn.new ci[:name], ci[:default_value], ci[:type], ci[:null], sqlserver_options
           end
         end
 
         # like postgres, sqlserver requires the ORDER BY columns in the select list for distinct queries, and
-        # requires that the ORDER BY include the distinct column.
-        # this method is idental to the postgres method
-        def columns_for_distinct(columns, orders) #:nodoc:
-          order_columns = orders.map{ |s|
-              # Convert Arel node to string
-              s = s.to_sql unless s.is_a?(String)
-              # Remove any ASC/DESC modifiers
-              s.gsub(/\s+(ASC|DESC)\s*(NULLS\s+(FIRST|LAST)\s*)?/i, '')
-            }.reject(&:blank?).map.with_index { |column, i| "#{column} AS alias_#{i}" }
-
-          [super, *order_columns].join(', ')
+        # requires that the ORDER BY include the distinct column. Unfortunately, sqlserver does not support
+        # DISTINCT ON () like Posgres, or FIRST_VALUE() like Oracle (at least before SQL Server 2012). Because
+        # of these facts, we don't actually add any extra columns for distinct, but instead have to create
+        # a subquery with ROW_NUMBER() and DENSE_RANK() in our monkey-patches to Arel.
+        def columns_for_distinct(columns, _orders) #:nodoc:
+          columns
         end
 
         def rename_table(table_name, new_name)
@@ -63,8 +63,8 @@ module ActiveRecord
           rename_table_indexes(table_name, new_name)
         end
 
-        def remove_column(table_name, column_name, type = nil)
-          raise ArgumentError.new("You must specify at least one column name.  Example: remove_column(:people, :first_name)") if (column_name.is_a? Array)
+        def remove_column(table_name, column_name, _type = nil)
+          raise ArgumentError.new('You must specify at least one column name.  Example: remove_column(:people, :first_name)') if column_name.is_a? Array
           remove_check_constraints(table_name, column_name)
           remove_default_constraint(table_name, column_name)
           remove_indexes(table_name, column_name)
@@ -74,30 +74,32 @@ module ActiveRecord
         def change_column(table_name, column_name, type, options = {})
           sql_commands = []
           indexes = []
-          column_object = schema_cache.columns(table_name).detect { |c| c.name.to_s == column_name.to_s }
+          column_object = schema_cache.columns(table_name).find { |c| c.name.to_s == column_name.to_s }
 
           if options_include_default?(options) || (column_object && column_object.type != type.to_sym)
-            remove_default_constraint(table_name,column_name)
-            indexes = indexes(table_name).select{ |index| index.columns.include?(column_name.to_s) }
+            remove_default_constraint(table_name, column_name)
+            indexes = indexes(table_name).select { |index| index.columns.include?(column_name.to_s) }
             remove_indexes(table_name, column_name)
           end
-          sql_commands << "UPDATE #{quote_table_name(table_name)} SET #{quote_column_name(column_name)}=#{quote(options[:default])} WHERE #{quote_column_name(column_name)} IS NULL" if !options[:null].nil? && options[:null] == false && !options[:default].nil?
+          sql_commands << "UPDATE #{quote_table_name(table_name)} SET #{quote_column_name(column_name)}=#{quote_default_value(options[:default], column_object)} WHERE #{quote_column_name(column_name)} IS NULL" if !options[:null].nil? && options[:null] == false && !options[:default].nil?
           sql_commands << "ALTER TABLE #{quote_table_name(table_name)} ALTER COLUMN #{quote_column_name(column_name)} #{type_to_sql(type, options[:limit], options[:precision], options[:scale])}"
-          sql_commands[-1] << " NOT NULL" if !options[:null].nil? && options[:null] == false
+          sql_commands[-1] << ' NOT NULL' if !options[:null].nil? && options[:null] == false
           if options_include_default?(options)
-            sql_commands << "ALTER TABLE #{quote_table_name(table_name)} ADD CONSTRAINT #{default_constraint_name(table_name,column_name)} DEFAULT #{quote(options[:default])} FOR #{quote_column_name(column_name)}"
+            sql_commands << "ALTER TABLE #{quote_table_name(table_name)} ADD CONSTRAINT #{default_constraint_name(table_name, column_name)} DEFAULT #{quote_default_value(options[:default], column_object)} FOR #{quote_column_name(column_name)}"
           end
 
-          #Add any removed indexes back
+          # Add any removed indexes back
           indexes.each do |index|
-            sql_commands << "CREATE INDEX #{quote_table_name(index.name)} ON #{quote_table_name(table_name)} (#{index.columns.collect {|c|quote_column_name(c)}.join(', ')})"
+            sql_commands << "CREATE INDEX #{quote_table_name(index.name)} ON #{quote_table_name(table_name)} (#{index.columns.map { |c| quote_column_name(c) }.join(', ')})"
           end
           sql_commands.each { |c| do_execute(c) }
         end
 
         def change_column_default(table_name, column_name, default)
           remove_default_constraint(table_name, column_name)
-          do_execute "ALTER TABLE #{quote_table_name(table_name)} ADD CONSTRAINT #{default_constraint_name(table_name, column_name)} DEFAULT #{quote(default)} FOR #{quote_column_name(column_name)}"
+          column_object = schema_cache.columns(table_name).find { |c| c.name.to_s == column_name.to_s }
+          do_execute "ALTER TABLE #{quote_table_name(table_name)} ADD CONSTRAINT #{default_constraint_name(table_name, column_name)} DEFAULT #{quote_default_value(default, column_object)} FOR #{quote_column_name(column_name)}"
+          schema_cache.clear_table_cache!(table_name)
         end
 
         def rename_column(table_name, column_name, new_column_name)
@@ -117,15 +119,15 @@ module ActiveRecord
         end
 
         def type_to_sql(type, limit = nil, precision = nil, scale = nil)
-          type_limitable = ['string','integer','float','char','nchar','varchar','nvarchar'].include?(type.to_s)
+          type_limitable = %w(string integer float char nchar varchar nvarchar).include?(type.to_s)
           limit = nil unless type_limitable
           case type.to_s
           when 'integer'
             case limit
-              when 1..2       then  'smallint'
-              when 3..4, nil  then  'integer'
-              when 5..8       then  'bigint'
-              else raise(ActiveRecordError, "No integer type has byte size #{limit}. Use a numeric with precision 0 instead.")
+            when 1..2       then  'smallint'
+            when 3..4, nil  then  'integer'
+            when 5..8       then  'bigint'
+            else raise(ActiveRecordError, "No integer type has byte size #{limit}. Use a numeric with precision 0 instead.")
             end
           else
             super
@@ -138,7 +140,7 @@ module ActiveRecord
             do_execute("UPDATE #{quote_table_name(table_name)} SET #{quote_column_name(column_name)}=#{quote(default)} WHERE #{quote_column_name(column_name)} IS NULL")
           end
           sql = "ALTER TABLE #{table_name} ALTER COLUMN #{quote_column_name(column_name)} #{type_to_sql column.type, column.limit, column.precision, column.scale}"
-          sql << " NOT NULL" if !allow_null.nil? && allow_null == false
+          sql << ' NOT NULL' if !allow_null.nil? && allow_null == false
           do_execute sql
         end
 
@@ -148,33 +150,33 @@ module ActiveRecord
           tables('VIEW')
         end
 
-
         protected
 
         # === SQLServer Specific ======================================== #
 
         def initialize_native_database_types
           {
-            :primary_key  => "int NOT NULL IDENTITY(1,1) PRIMARY KEY",
-            :string       => { :name => native_string_database_type, :limit => 255  },
-            :text         => { :name => native_text_database_type },
-            :integer      => { :name => "int", :limit => 4 },
-            :float        => { :name => "float", :limit => 8 },
-            :decimal      => { :name => "decimal" },
-            :datetime     => { :name => "datetime" },
-            :timestamp    => { :name => "datetime" },
-            :time         => { :name => native_time_database_type },
-            :date         => { :name => native_date_database_type },
-            :binary       => { :name => native_binary_database_type },
-            :boolean      => { :name => "bit"},
+            primary_key: 'int NOT NULL IDENTITY(1,1) PRIMARY KEY',
+            string: { name: native_string_database_type, limit: 255  },
+            text: { name: native_text_database_type },
+            integer: { name: 'int', limit: 4 },
+            float: { name: 'float', limit: 8 },
+            decimal: { name: 'decimal' },
+            datetime: { name: 'datetime' },
+            timestamp: { name: 'datetime' },
+            time: { name: native_time_database_type },
+            date: { name: native_date_database_type },
+            binary: { name: native_binary_database_type },
+            boolean: { name: 'bit' },
+            uuid: { name: 'uniqueidentifier' },
             # These are custom types that may move somewhere else for good schema_dumper.rb hacking to output them.
-            :char         => { :name => 'char' },
-            :varchar_max  => { :name => 'varchar(max)' },
-            :nchar        => { :name => "nchar" },
-            :nvarchar     => { :name => "nvarchar", :limit => 255 },
-            :nvarchar_max => { :name => "nvarchar(max)" },
-            :ntext        => { :name => "ntext" },
-            :ss_timestamp => { :name => 'timestamp' }
+            char: { name: 'char' },
+            varchar_max: { name: 'varchar(max)' },
+            nchar: { name: 'nchar' },
+            nvarchar: { name: 'nvarchar', limit: 255 },
+            nvarchar_max: { name: 'nvarchar(max)' },
+            ntext: { name: 'ntext' },
+            ss_timestamp: { name: 'timestamp' }
           }
         end
 
@@ -226,29 +228,29 @@ module ActiveRecord
               ON o.object_id = c.object_id
               AND c.name = columns.COLUMN_NAME
             WHERE columns.TABLE_NAME = @0
-              AND columns.TABLE_SCHEMA = #{table_schema.blank? ? "schema_name()" : "@1"}
+              AND columns.TABLE_SCHEMA = #{table_schema.blank? ? 'schema_name()' : '@1'}
             ORDER BY columns.ordinal_position
-          }.gsub(/[ \t\r\n]+/,' ')
+          }.gsub(/[ \t\r\n]+/, ' ')
           binds = [['table_name', table_name]]
-          binds << ['table_schema',table_schema] unless table_schema.blank?
+          binds << ['table_schema', table_schema] unless table_schema.blank?
           results = do_exec_query(sql, 'SCHEMA', binds)
-          results.collect do |ci|
+          results.map do |ci|
             ci = ci.symbolize_keys
             ci[:type] = case ci[:type]
-                         when /^bit|image|text|ntext|datetime$/
-                           ci[:type]
-                         when /^numeric|decimal$/i
-                           "#{ci[:type]}(#{ci[:numeric_precision]},#{ci[:numeric_scale]})"
-                         when /^float|real$/i
-                           "#{ci[:type]}(#{ci[:numeric_precision]})"
-                         when /^char|nchar|varchar|nvarchar|varbinary|bigint|int|smallint$/
-                           ci[:length].to_i == -1 ? "#{ci[:type]}(max)" : "#{ci[:type]}(#{ci[:length]})"
-                         else
-                           ci[:type]
-                         end
+                        when /^bit|image|text|ntext|datetime$/
+                          ci[:type]
+                        when /^numeric|decimal$/i
+                          "#{ci[:type]}(#{ci[:numeric_precision]},#{ci[:numeric_scale]})"
+                        when /^float|real$/i
+                          "#{ci[:type]}(#{ci[:numeric_precision]})"
+                        when /^char|nchar|varchar|nvarchar|varbinary|bigint|int|smallint$/
+                          ci[:length].to_i == -1 ? "#{ci[:type]}(max)" : "#{ci[:type]}(#{ci[:length]})"
+                        else
+                          ci[:type]
+                        end
             if ci[:default_value].nil? && schema_cache.view_names.include?(table_name)
               real_table_name = table_name_or_views_table_name(table_name)
-              real_column_name = views_real_column_name(table_name,ci[:name])
+              real_column_name = views_real_column_name(table_name, ci[:name])
               col_default_sql = "SELECT c.COLUMN_DEFAULT FROM #{db_name_with_period}INFORMATION_SCHEMA.COLUMNS c WHERE c.TABLE_NAME = '#{real_table_name}' AND c.COLUMN_NAME = '#{real_column_name}'"
               ci[:default_value] = select_value col_default_sql, 'SCHEMA'
             end
@@ -256,13 +258,14 @@ module ActiveRecord
                                  when nil, '(null)', '(NULL)'
                                    nil
                                  when /\A\((\w+\(\))\)\Z/
-                                   ci[:default_function] = $1
+                                   ci[:default_function] = Regexp.last_match[1]
                                    nil
                                  else
                                    match_data = ci[:default_value].match(/\A\(+N?'?(.*?)'?\)+\Z/m)
-                                   match_data ? match_data[1] : nil
+                                   match_data ? match_data[1].gsub("''", "'") : nil
                                  end
-            ci[:null] = ci[:is_nullable].to_i == 1 ; ci.delete(:is_nullable)
+            ci[:null] = ci[:is_nullable].to_i == 1
+            ci.delete(:is_nullable)
             ci[:is_primary] = ci[:is_primary].to_i == 1
             ci[:is_identity] = ci[:is_identity].to_i == 1 unless [TrueClass, FalseClass].include?(ci[:is_identity].class)
             ci
@@ -286,8 +289,8 @@ module ActiveRecord
         end
 
         def remove_indexes(table_name, column_name)
-          indexes(table_name).select{ |index| index.columns.include?(column_name.to_s) }.each do |index|
-            remove_index(table_name, {:name => index.name})
+          indexes(table_name).select { |index| index.columns.include?(column_name.to_s) }.each do |index|
+            remove_index(table_name, name: index.name)
           end
         end
 
@@ -295,9 +298,9 @@ module ActiveRecord
 
         def get_table_name(sql)
           if sql =~ /^\s*(INSERT|EXEC sp_executesql N'INSERT)(\s+INTO)?\s+([^\(\s]+)\s*|^\s*update\s+([^\(\s]+)\s*/i
-            $3 || $4
+            Regexp.last_match[3] || Regexp.last_match[4]
           elsif sql =~ /FROM\s+([^\(\s]+)\s*/i
-            $1
+            Regexp.last_match[1]
           else
             nil
           end
@@ -308,7 +311,7 @@ module ActiveRecord
         end
 
         def detect_column_for!(table_name, column_name)
-          unless column = schema_cache.columns(table_name).detect { |c| c.name == column_name.to_s }
+          unless column = schema_cache.columns(table_name).find { |c| c.name == column_name.to_s }
             raise ActiveRecordError, "No such column: #{table_name}.#{column_name}"
           end
           column
@@ -347,7 +350,7 @@ module ActiveRecord
           schema_cache.view_names.include?(unquoted_table_name) ? view_table_name(unquoted_table_name) : unquoted_table_name
         end
 
-        def views_real_column_name(table_name,column_name)
+        def views_real_column_name(table_name, column_name)
           view_definition = schema_cache.view_information(table_name)[:VIEW_DEFINITION]
           match_data = view_definition.match(/([\w-]*)\s+as\s+#{column_name}/im)
           match_data ? match_data[1] : column_name
@@ -356,7 +359,6 @@ module ActiveRecord
         # === SQLServer Specific (Identity Inserts) ===================== #
 
         def query_requires_identity_insert?(sql)
-
           if insert_sql?(sql)
             table_name = get_table_name(sql)
             id_column = identity_column(table_name)
@@ -370,6 +372,27 @@ module ActiveRecord
           !(sql =~ /^\s*(INSERT|EXEC sp_executesql N'INSERT)/i).nil?
         end
 
+        def strip_ident_from_update(sql)
+          # We can't update Identiy columns in sqlserver.  So, strip out the id from the update.
+          # There has to be a better way to handle this, but this'll do for now.
+          table_name = get_table_name(sql)
+          id_column = identity_column(table_name)
+
+          if id_column
+            regex_col_name = Regexp.quote(quote_column_name(id_column.name))
+            if sql =~ /, #{regex_col_name} = @?[0-9]*/
+              sql = sql.gsub(/, #{regex_col_name} = @?[0-9]*/, '')
+            elsif sql =~ /\s#{regex_col_name} = @?[0-9]*,/
+              sql = sql.gsub(/\s#{regex_col_name} = @?[0-9]*,/, '')
+            end
+          end
+          sql
+        end
+
+        def update_sql?(sql)
+          !(sql =~ /^\s*(UPDATE|EXEC sp_executesql N'UPDATE)/i).nil?
+        end
+
         def with_identity_insert_enabled(table_name)
           table_name = quote_table_name(table_name_or_views_table_name(table_name))
           set_identity_insert(table_name, true)
@@ -381,14 +404,19 @@ module ActiveRecord
         def set_identity_insert(table_name, enable = true)
           sql = "SET IDENTITY_INSERT #{table_name} #{enable ? 'ON' : 'OFF'}"
           do_execute sql, 'SCHEMA'
-        rescue Exception => e
+        rescue Exception
           raise ActiveRecordError, "IDENTITY_INSERT could not be turned #{enable ? 'ON' : 'OFF'} for table #{table_name}"
         end
 
         def identity_column(table_name)
-          schema_cache.columns(table_name).detect(&:is_identity?)
+          schema_cache.columns(table_name).find(&:is_identity?)
         end
 
+        private
+
+        def create_table_definition(name, temporary, options, as = nil)
+          TableDefinition.new native_database_types, name, temporary, options, as
+        end
       end
     end
   end
